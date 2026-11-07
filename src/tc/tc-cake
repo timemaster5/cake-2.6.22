@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+directory=$(CDPATH= cd "$(dirname "$0")" && pwd)
+LD_PRELOAD="$directory/q_cake.so${LD_PRELOAD:+:$LD_PRELOAD}"
+export LD_PRELOAD
+exec "$directory/tc" "$@"

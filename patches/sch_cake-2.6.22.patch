@@ -1,0 +1,483 @@
+--- a/sch_cake.c
++++ b/sch_cake.c
+@@ -70,7 +70,7 @@
+ #include <linux/if_vlan.h>
+ #include <net/tcp.h>
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 2, 0)
+-#include <net/flow_keys.h>
++#include "merlin_compat.h"
+ #else
+ #include <net/flow_dissector.h>
+ #endif
+@@ -78,7 +78,7 @@
+ 
+ #if IS_REACHABLE(CONFIG_NF_CONNTRACK)
+ #include <net/netfilter/nf_conntrack_core.h>
+-#include <net/netfilter/nf_conntrack_zones.h>
++
+ #include <net/netfilter/nf_conntrack.h>
+ #endif
+ 
+@@ -206,6 +206,7 @@
+ }; /* number of tins is small, so size of this struct doesn't matter much */
+ 
+ struct cake_sched_data {
++	u32 packet_limit;
+ 	struct tcf_proto __rcu *filter_list; /* optional external classifier */
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+ 	struct tcf_block *block;
+@@ -661,25 +662,18 @@
+ 		const struct nf_conntrack_tuple_hash *hash;
+ 		struct nf_conntrack_tuple srctuple;
+ 
+-#if KERNEL_VERSION(4, 4, 0) > LINUX_VERSION_CODE
+-		if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb),
+-				       NFPROTO_IPV4, &srctuple))
+-#else
+-		if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb),
+-				       NFPROTO_IPV4, dev_net(skb->dev),
+-				       &srctuple))
+-#endif
+-			return;
+-
+-#if KERNEL_VERSION(4, 3, 0) > LINUX_VERSION_CODE
+-		hash = nf_conntrack_find_get(dev_net(skb->dev),
+-					     NF_CT_DEFAULT_ZONE,
+-					     &srctuple);
+-#else
+-		hash = nf_conntrack_find_get(dev_net(skb->dev),
+-					     &nf_ct_zone_dflt,
+-					     &srctuple);
+-#endif
++if (keys->ip_proto != IPPROTO_TCP && keys->ip_proto != IPPROTO_UDP &&
++            keys->ip_proto != IPPROTO_SCTP && keys->ip_proto != IPPROTO_DCCP)
++            return;
++        memset(&srctuple, 0, sizeof(srctuple));
++        srctuple.src.l3num = AF_INET;
++        srctuple.src.u3.ip = keys->src;
++        srctuple.dst.u3.ip = keys->dst;
++        srctuple.src.u.all = keys->port16[0];
++        srctuple.dst.u.all = keys->port16[1];
++        srctuple.dst.protonum = keys->ip_proto;
++        hash = nf_conntrack_find_get(&srctuple, NULL);
++
+ 		if (!hash)
+ 			return;
+ 
+@@ -1655,7 +1649,7 @@
+ 		cake_advance_shaper(q, b, skb, now, true);
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
+-	kfree_skb(skb);
++	cake_free_skb(skb);
+ #else
+ 	__qdisc_drop(skb, to_free);
+ #endif
+@@ -1826,7 +1820,7 @@
+ 		if (ret & __NET_XMIT_BYPASS)
+ 			qdisc_qstats_drop(sch);
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
+-		kfree_skb(skb);
++		cake_free_skb(skb);
+ #else
+ 		__qdisc_drop(skb, to_free);
+ #endif
+@@ -1859,7 +1853,7 @@
+ 	if (unlikely(len > b->max_skblen))
+ 		b->max_skblen = len;
+ 
+-	if (skb_is_gso(skb) && q->rate_flags & CAKE_FLAG_SPLIT_GSO) {
++	if (skb_is_gso(skb) && cake_may_split_gso(skb) && q->rate_flags & CAKE_FLAG_SPLIT_GSO) {
+ 		struct sk_buff *segs, *nskb;
+ 		netdev_features_t features = netif_skb_features(skb);
+ 		unsigned int slen = 0, numsegs = 0;
+@@ -2070,7 +2064,15 @@
+ 	q->cur_tin = tin;
+ 	for (q->cur_flow = 0; q->cur_flow < CAKE_QUEUES; q->cur_flow++)
+ 		while (!!(skb = cake_dequeue_one(sch)))
+-			kfree_skb(skb);
++			cake_free_skb(skb);
++}
++
++static int cake_requeue(struct sk_buff *skb, struct Qdisc *sch)
++{
++    __skb_queue_head(&sch->q, skb);
++    sch->qstats.backlog += skb->len;
++    sch->qstats.requeues++;
++    return NET_XMIT_SUCCESS;
+ }
+ 
+ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+@@ -2088,6 +2090,11 @@
+ 	u32 len;
+ 
+ begin:
++    skb = __skb_dequeue(&sch->q);
++    if (skb) {
++        sch->qstats.backlog -= skb->len;
++        return skb;
++    }
+ 	if (!sch->q.qlen)
+ 		return NULL;
+ 
+@@ -2306,10 +2313,10 @@
+ 		b->tin_dropped++;
+ 		qdisc_tree_reduce_backlog(sch, 1, qdisc_pkt_len(skb));
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
+-		qdisc_drop(skb, sch);
++		cake_qdisc_drop(skb, sch);
+ #else
+ 		qdisc_qstats_drop(sch);
+-		kfree_skb(skb);
++		cake_free_skb(skb);
+ #endif
+ 		if (q->rate_flags & CAKE_FLAG_INGRESS)
+ 			goto retry;
+@@ -2359,10 +2366,14 @@
+ 
+ static void cake_reset(struct Qdisc *sch)
+ {
+-	u32 c;
+-
+-	for (c = 0; c < CAKE_MAX_TINS; c++)
+-		cake_clear_tin(sch, c);
++    struct sk_buff *skb;
++    u32 c;
++    for (c = 0; c < CAKE_MAX_TINS; c++)
++        cake_clear_tin(sch, c);
++    while ((skb = __skb_dequeue(&sch->q))) {
++        sch->qstats.backlog -= skb->len;
++        cake_free_skb(skb);
++    }
+ }
+ 
+ static const struct nla_policy cake_policy[TCA_CAKE_MAX + 1] = {
+@@ -2690,15 +2701,15 @@
+ 		q->buffer_limit = ~0;
+ 	}
+ 
+-	sch->flags &= ~TCQ_F_CAN_BYPASS;
++	
+ 
+ 	q->buffer_limit = min(q->buffer_limit,
+-			      max(sch->limit * psched_mtu(qdisc_dev(sch)),
++			      max(q->packet_limit * psched_mtu(qdisc_dev(sch)),
+ 				  q->buffer_config_limit));
+ }
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
+-static int cake_change(struct Qdisc *sch, struct nlattr *opt)
++static int cake_change(struct Qdisc *sch, struct rtattr *opt)
+ #else
+ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
+ 		struct netlink_ext_ack *extack)
+@@ -2712,11 +2723,11 @@
+ 		return -EINVAL;
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 12, 0)
+-	err = nla_parse_nested(tb, TCA_CAKE_MAX, opt, cake_policy);
++	err = nla_parse_nested(tb, TCA_CAKE_MAX, (struct nlattr *)opt, cake_policy);
+ #elif LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
+-	err = nla_parse_nested(tb, TCA_CAKE_MAX, opt, cake_policy, NULL);
++	err = nla_parse_nested(tb, TCA_CAKE_MAX, (struct nlattr *)opt, cake_policy, NULL);
+ #else
+-	err = nla_parse_nested(tb, TCA_CAKE_MAX, opt, cake_policy, extack);
++	err = nla_parse_nested(tb, TCA_CAKE_MAX, (struct nlattr *)opt, cake_policy, extack);
+ #endif
+ 	if (err < 0)
+ 		return err;
+@@ -2839,7 +2850,7 @@
+ 
+ 	qdisc_watchdog_cancel(&q->watchdog);
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0)
+-	tcf_destroy_chain(&q->filter_list);
++	tcf_destroy_chain(q->filter_list);
+ #else
+ 	tcf_block_put(q->block);
+ #endif
+@@ -2847,7 +2858,7 @@
+ }
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
+-static int cake_init(struct Qdisc *sch, struct nlattr *opt)
++static int cake_init(struct Qdisc *sch, struct rtattr *opt)
+ #else
+ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+ 		struct netlink_ext_ack *extack)
+@@ -2856,7 +2867,7 @@
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+ 	int i, j, err;
+ 
+-	sch->limit = 10240;
++	q->packet_limit = 10240;
+ 	q->tin_mode = CAKE_DIFFSERV_DIFFSERV3;
+ 	q->flow_mode  = CAKE_FLOW_TRIPLE;
+ 
+@@ -3264,7 +3275,7 @@
+ 	}
+ }
+ 
+-static const struct Qdisc_class_ops cake_class_ops = {
++static struct Qdisc_class_ops cake_class_ops = {
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0)
+ 	.tcf_chain	=	cake_find_tcf,
+ #else
+@@ -3290,7 +3301,7 @@
+ 	.priv_size	=	sizeof(struct cake_sched_data),
+ 	.enqueue	=	cake_enqueue,
+ 	.dequeue	=	cake_dequeue,
+-	.peek		=	qdisc_peek_dequeued,
++	.requeue	=	cake_requeue,
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
+ 	.drop		=	cake_drop,
+ #endif
+--- /dev/null
++++ b/merlin_compat.h
+@@ -0,0 +1,210 @@
++#ifndef CAKE_MERLIN_COMPAT_H
++#define CAKE_MERLIN_COMPAT_H
++
++#include <linux/random.h>
++#include <linux/ipv6.h>
++#include <net/ip.h>
++#include <net/ipv6.h>
++#include <asm/pgtable.h>
++#include <asm/highmem.h>
++#include <linux/imq.h>
++#include "merlin_imq.h"
++
++#define __rcu
++#define BIT(nr) (1UL << (nr))
++#define ETH_P_8021AD 0x88a8
++#define TCPOPT_EXP 254
++#define NLA_S32 NLA_U32
++#define __NET_XMIT_BYPASS 0x10000
++#define __NET_XMIT_STOLEN 0x20000
++#define rcu_dereference_bh(p) rcu_dereference(p)
++#define prandom_u32() random32()
++#define consume_skb(skb) cake_free_skb(skb)
++#define qdisc_dev(sch) ((sch)->dev)
++#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
++
++#define CAKE_DEFINED_1 0,
++#define CAKE_SECOND(ignored, value, ...) value
++#define CAKE_DEFINED_STEP(arg) CAKE_SECOND(arg 1, 0)
++#define CAKE_DEFINED_EXPAND(value) CAKE_DEFINED_STEP(CAKE_DEFINED_##value)
++#define config_enabled(option) CAKE_DEFINED_EXPAND(option)
++
++typedef unsigned long netdev_features_t;
++
++static inline int is_vmalloc_addr(const void *ptr)
++{
++	unsigned long addr = (unsigned long)ptr;
++	return addr >= VMALLOC_START && addr < VMALLOC_END;
++}
++
++static inline void *vzalloc(unsigned long size)
++{
++	void *ptr = vmalloc(size);
++	if (ptr)
++		memset(ptr, 0, size);
++	return ptr;
++}
++
++struct cake_legacy_skb_cb {
++	u8 protocol_private[24];
++	u32 pkt_len;
++	u32 padding;
++	u8 data[16];
++};
++
++static inline struct cake_legacy_skb_cb *qdisc_skb_cb(const struct sk_buff *skb)
++{
++	BUILD_BUG_ON(sizeof(struct cake_legacy_skb_cb) > sizeof(skb->cb));
++	BUILD_BUG_ON(sizeof(struct inet_skb_parm) > 24);
++	BUILD_BUG_ON(sizeof(struct inet6_skb_parm) > 24);
++	return (struct cake_legacy_skb_cb *)skb->cb;
++}
++
++#define qdisc_cb_private_validate(skb, size) \
++	BUILD_BUG_ON((size) > sizeof(((struct cake_legacy_skb_cb *)0)->data))
++#define qdisc_pkt_len(skb) ((skb)->len)
++
++static inline void qdisc_bstats_update(struct Qdisc *sch,
++				       const struct sk_buff *skb)
++{
++	sch->bstats.bytes += skb->len;
++	sch->bstats.packets++;
++}
++
++static inline ktime_t ns_to_ktime(u64 ns)
++{
++	return ktime_add_ns(ktime_set(0, 0), ns);
++}
++
++static inline int ktime_compare(ktime_t a, ktime_t b)
++{
++	s64 na = ktime_to_ns(a), nb = ktime_to_ns(b);
++	return (na > nb) - (na < nb);
++}
++
++static inline void qdisc_watchdog_schedule_ns(struct qdisc_watchdog *wd, u64 ns)
++{
++	qdisc_watchdog_schedule(wd, PSCHED_NS2US(ns));
++}
++
++#define qdisc_tree_reduce_backlog(sch, packets, bytes) \
++	qdisc_tree_decrease_qlen(sch, packets)
++
++static inline u32 get_unaligned_be32(const void *ptr)
++{
++	__be32 value;
++	memcpy(&value, ptr, sizeof(value));
++	return be32_to_cpu(value);
++}
++
++static inline s32 nla_get_s32(struct nlattr *nla)
++{
++	return (s32)nla_get_u32(nla);
++}
++
++static inline int nla_put_s32(struct sk_buff *skb, int type, s32 value)
++{
++	return nla_put_u32(skb, type, (u32)value);
++}
++
++/* Force segmentation and checksum work into software on the legacy stack. */
++static inline netdev_features_t netif_skb_features(const struct sk_buff *skb)
++{
++	return 0;
++}
++
++/* Legacy IMQ segments would share a non-refcounted nf_info owner. */
++static inline bool cake_may_split_gso(const struct sk_buff *skb)
++{
++	return !(skb->imq_flags & IMQ_F_ENQUEUE);
++}
++
++struct flow_keys {
++	__be32 src, dst;
++	union {
++		__be32 ports;
++		__be16 port16[2];
++	};
++	u8 ip_proto;
++};
++
++static inline bool skb_flow_dissect(const struct sk_buff *skb,
++				   struct flow_keys *keys)
++{
++	unsigned int offset = skb_network_offset(skb);
++	__be16 proto = skb->protocol;
++	__be32 portbuf;
++	const __be32 *ports;
++	unsigned int depth;
++
++	memset(keys, 0, sizeof(*keys));
++	for (depth = 0; depth < 4; depth++) {
++		struct vlan_hdr buffer;
++		const struct vlan_hdr *vlan;
++		if (proto != htons(ETH_P_8021Q) && proto != htons(ETH_P_8021AD))
++			break;
++		vlan = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		if (!vlan)
++			return false;
++		proto = vlan->h_vlan_encapsulated_proto;
++		offset += sizeof(buffer);
++	}
++	if (proto == htons(ETH_P_IP)) {
++		struct iphdr buffer;
++		const struct iphdr *ip;
++		ip = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		if (!ip || ip->version != 4 || ip->ihl < 5)
++			return false;
++		keys->src = ip->saddr;
++		keys->dst = ip->daddr;
++		keys->ip_proto = ip->protocol;
++		if (ip->frag_off & htons(IP_MF | IP_OFFSET))
++			return true;
++		offset += ip->ihl * 4;
++	} else if (proto == htons(ETH_P_IPV6)) {
++		struct ipv6hdr buffer;
++		const struct ipv6hdr *ip;
++		u8 nexthdr;
++		ip = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		if (!ip || ip->version != 6)
++			return false;
++		keys->src = (__force __be32)jhash(&ip->saddr, sizeof(ip->saddr), 0);
++		keys->dst = (__force __be32)jhash(&ip->daddr, sizeof(ip->daddr), 0);
++		nexthdr = ip->nexthdr;
++		offset += sizeof(buffer);
++		for (depth = 0; depth < 16; depth++) {
++			struct ipv6_opt_hdr buffer;
++			const struct ipv6_opt_hdr *ext;
++			if (nexthdr == IPPROTO_FRAGMENT) {
++				keys->ip_proto = nexthdr;
++				return true;
++			}
++			if (nexthdr != IPPROTO_HOPOPTS && nexthdr != IPPROTO_ROUTING &&
++			    nexthdr != IPPROTO_DSTOPTS && nexthdr != IPPROTO_AH)
++				break;
++			ext = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++			if (!ext)
++				return false;
++			offset += nexthdr == IPPROTO_AH ? (ext->hdrlen + 2) * 4 :
++				(ext->hdrlen + 1) * 8;
++			nexthdr = ext->nexthdr;
++		}
++		if (depth == 16)
++			return false;
++		keys->ip_proto = nexthdr;
++	} else {
++		return false;
++	}
++	if (keys->ip_proto != IPPROTO_TCP && keys->ip_proto != IPPROTO_UDP &&
++	    keys->ip_proto != IPPROTO_SCTP && keys->ip_proto != IPPROTO_DCCP)
++		return true;
++	ports = skb_header_pointer(skb, offset, sizeof(portbuf), &portbuf);
++	if (!ports)
++		return false;
++	keys->ports = *ports;
++	return true;
++}
++
++#define nf_ct_tuple(ct, dir) (&(ct)->tuplehash[dir].tuple)
++
++#endif
+--- /dev/null
++++ b/merlin_imq.h
+@@ -0,0 +1,34 @@
++#ifndef CAKE_MERLIN_IMQ_H
++#define CAKE_MERLIN_IMQ_H
++
++#include <linux/skbuff.h>
++#include <linux/netfilter.h>
++#include <linux/imq.h>
++#include <net/sch_generic.h>
++
++static inline void cake_free_skb(struct sk_buff *skb)
++{
++	/* IMQ's queued-drop destructor omits netfilter's hook module reference. */
++	if ((skb->imq_flags & IMQ_F_ENQUEUE) && skb->nf_info &&
++	    skb->destructor && !skb_shared(skb)) {
++		struct nf_info *info = skb->nf_info;
++
++		skb->destructor = NULL;
++		skb->nf_info = NULL;
++		skb->imq_flags = 0;
++		nf_reinject(skb, info, NF_DROP);
++		return;
++	}
++
++	/* A shared skb rejected during enqueue is still owned by imq_nf_queue. */
++	kfree_skb(skb);
++}
++
++static inline int cake_qdisc_drop(struct sk_buff *skb, struct Qdisc *sch)
++{
++	cake_free_skb(skb);
++	sch->qstats.drops++;
++	return NET_XMIT_DROP;
++}
++
++#endif
