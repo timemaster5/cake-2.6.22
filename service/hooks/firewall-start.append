@@ -1,0 +1,6 @@
+
+# cake-2.6.22 begin
+if [ -x /jffs/cake/cake-service.sh ]; then
+    nohup /bin/sh /jffs/cake/cake-service.sh event >> /tmp/cake-service-hooks.log 2>&1 < /dev/null &
+fi
+# cake-2.6.22 end

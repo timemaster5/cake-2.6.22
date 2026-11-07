@@ -1,0 +1,7 @@
+# Copy to /jffs/cake/cake.conf. Rates are kbit/s on the WAN device.
+ENABLED=1
+DOWNLOAD_KBIT=4000
+UPLOAD_KBIT=2000
+WAN_IF=ppp0
+# AUTORATE=1 also starts runtime/lte-autorate.sh if present (optional, separate project).
+AUTORATE=0

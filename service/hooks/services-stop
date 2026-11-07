@@ -1,0 +1,4 @@
+#!/bin/sh
+if [ -x /jffs/cake/cake-service.sh ]; then
+    /bin/sh /jffs/cake/cake-service.sh stop >> /tmp/cake-service-hooks.log 2>&1
+fi
