@@ -62,4 +62,4 @@ cat hooks/firewall-start.append >> /jffs/scripts/firewall-start
 "$base/cake-service.sh" event
 "$base/cake-service.sh" status
 complete=1
-echo 'Installed. Edit /jffs/cake/cake.conf for your rates, then run: /jffs/cake/cake-service.sh start'
+echo 'Installed and running. Edit /jffs/cake/cake.conf for your rates; changes apply within 30 seconds.'
