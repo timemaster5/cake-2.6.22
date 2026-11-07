@@ -163,7 +163,14 @@ autorate() {
     [ "$(cat "$run/state" 2>/dev/null || :)" = active ] || return 0
     p=$(cat /tmp/lte-autorate/pid 2>/dev/null || :)
     case "$p" in ''|*[!0-9]*) ;; *) if kill -0 "$p" 2>/dev/null; then return 0; fi;; esac
-    DL_BASE=$DOWNLOAD_KBIT UL_BASE=$UPLOAD_KBIT nohup /bin/sh "$bin/lte-autorate.sh" run >> "$run/autorate.out" 2>&1 < /dev/null &
+    set -f
+    for o in ${AUTORATE_OPTS:-}; do
+        n=${o%%=*}; v=${o#*=}
+        case "$n" in ''|*[!A-Z_]*) log "AUTORATE_OPTS: bad name in $o"; set +f; return 0;; esac
+        case "$v" in ''|*[!0-9]*) log "AUTORATE_OPTS: bad value in $o"; set +f; return 0;; esac
+    done
+    env ${AUTORATE_OPTS:-} DL_BASE=$DOWNLOAD_KBIT UL_BASE=$UPLOAD_KBIT nohup /bin/sh "$bin/lte-autorate.sh" run >> "$run/autorate.out" 2>&1 < /dev/null &
+    set +f
 }
 case "${1:-status}" in
 status) status;;

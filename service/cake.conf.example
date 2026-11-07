@@ -5,3 +5,5 @@ UPLOAD_KBIT=2000
 WAN_IF=ppp0
 # AUTORATE=1 also starts runtime/lte-autorate.sh if present (optional, separate project).
 AUTORATE=0
+# Extra lte-autorate settings, NAME=digits tokens only.
+#AUTORATE_OPTS="HIGH_MS=50 DL_MIN=1500"

@@ -75,6 +75,8 @@ The service refuses to adopt CAKE/IMQ state it did not create, and refuses to ru
 
 With `AUTORATE=1` in `cake.conf`, the service also starts `/jffs/cake/runtime/lte-autorate.sh`
 if that file exists, using `DOWNLOAD_KBIT`/`UPLOAD_KBIT` as its base rates, and stops it on `stop`.
+Extra controller settings go into `AUTORATE_OPTS`, e.g. `AUTORATE_OPTS="HIGH_MS=50 DL_MIN=1500"`
+(`NAME=digits` tokens only; anything else is logged and the controller is not started).
 The controller is a separate project and is not included:
 <https://github.com/timemaster5/lte-autorate>. Without the file, or with `AUTORATE=0`, nothing changes.
 
@@ -94,8 +96,8 @@ indicative, not a controlled benchmark).
   42.7 / 92, 42.1 / 95, 43.5 / 203; upload shaped to 1 and 2 Mbit/s 36.4 / 55, 30.8 / 51;
   4 down + 2 up together 35.1 / 112. No packet loss in any stage. Goodput of a single
   transfer was 1.1 to 3.8 Mbit/s down and 0.8 to 1.3 Mbit/s up at those settings.
-- **CPU**: window-average CPU busy 7 to 11 % across those stages. Softirq about 25 % at 4 Mbit/s
-  download (from test notes, not a logged series). Over the multi-day run the 5-minute average
+- **CPU**: window-average CPU busy 7 to 11 % across those stages. Softirq (where CAKE and IMQ run)
+  in 300 one-second samples with 2 to 3.9 Mbit/s of download: median 4 %, p95 11 %, max 21 %. Over the multi-day run the 5-minute average
   was 1.1 % median, 10.9 % at p95, 36.8 % at the worst sample.
 - **Multi-day run**: 34.8 hours, 418 five-minute samples at 4 Mbit/s down / 2 Mbit/s up
   (IPv4 download): 8.9 GB down, 1.9 GB up, upload queue drops 0.16 % of packets. No reboot,
@@ -112,6 +114,8 @@ indicative, not a controlled benchmark).
   was not tested; the 15 Mbit/s figure is an estimate, not a measurement.
 - Ingress shaping is **IPv4 only**: the IMQ rule is an iptables rule. IPv6 is not redirected.
 - Only the firmware, kernel and libraries listed above are supported.
+- `install.sh`, `update.sh` and `uninstall.sh` follow the install that was done and verified by hand
+  on the test router, but the scripts themselves have not yet been run on hardware.
 - Not tested: multi-client NAT fairness, fragments and GSO paths beyond normal traffic, repeated
   unload/reload under load, sustained rates above 4 Mbit/s.
 
